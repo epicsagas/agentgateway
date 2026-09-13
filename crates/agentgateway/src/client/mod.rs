@@ -230,8 +230,35 @@ impl From<Transport> for ConnectionConfig {
 	}
 }
 
-#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct PoolKey(Target, SocketAddr, ConnectionConfig, ::http::Version);
+
+impl PartialEq for PoolKey {
+	fn eq(&self, other: &Self) -> bool {
+		if self.0 != other.0 || self.2 != other.2 {
+			return false;
+		}
+		// For TLS, ALPN negotiates the protocol so the downstream request version
+		// does not separate connection pools. For Plaintext, H1 vs H2 (prior knowledge)
+		// require separate connection pools.
+		match self.2.transport.application() {
+			ApplicationTransport::Plaintext => self.3 == other.3,
+			ApplicationTransport::Tls(_) => true,
+		}
+	}
+}
+
+impl Eq for PoolKey {}
+
+impl std::hash::Hash for PoolKey {
+	fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+		self.0.hash(state);
+		self.2.hash(state);
+		if matches!(self.2.transport.application(), ApplicationTransport::Plaintext) {
+			self.3.hash(state);
+		}
+	}
+}
 
 impl agent_pool::pool::Key for PoolKey {
 	fn expected_capacity(&self) -> ExpectedCapacity {
@@ -266,10 +293,9 @@ impl agent_pool::pool::Key for PoolKey {
 	}
 
 	fn shard(&self) -> usize {
-		match self.1.ip() {
-			std::net::IpAddr::V4(addr) => addr.octets()[3] as usize,
-			std::net::IpAddr::V6(addr) => addr.segments()[7] as usize,
-		}
+		let mut hasher = std::collections::hash_map::DefaultHasher::new();
+		std::hash::Hash::hash(&self.0, &mut hasher);
+		std::hash::Hasher::finish(&hasher) as usize
 	}
 
 	fn connect_timeout(&self) -> Option<Duration> {
@@ -923,5 +949,33 @@ mod tests {
 			(ms - ms.round()).abs() > 1e-9,
 			"connect duration {ms}ms is quantized to whole milliseconds"
 		);
+	}
+
+	#[test]
+	fn test_pool_key_ip_invariance_and_sharding() {
+		use std::hash::{DefaultHasher, Hash, Hasher};
+		use agent_pool::pool::Key;
+
+		let target = Target::Hostname(strng::new("api.openai.com"), 443);
+		let addr1: SocketAddr = "192.0.2.1:443".parse().unwrap();
+		let addr2: SocketAddr = "192.0.2.2:443".parse().unwrap();
+		let conn_cfg: ConnectionConfig = Transport::Plain(ApplicationTransport::Plaintext).into();
+
+		let key1 = PoolKey(target.clone(), addr1, conn_cfg.clone(), ::http::Version::HTTP_11);
+		let key2 = PoolKey(target.clone(), addr2, conn_cfg.clone(), ::http::Version::HTTP_11);
+
+		// Different IPs for the same target must share the pool key and shard
+		assert_eq!(key1, key2, "keys with different IPs must be equal");
+
+		let mut h1 = DefaultHasher::new();
+		key1.hash(&mut h1);
+		let mut h2 = DefaultHasher::new();
+		key2.hash(&mut h2);
+		assert_eq!(h1.finish(), h2.finish(), "hashes with different IPs must match");
+		assert_eq!(key1.shard(), key2.shard(), "shards must match");
+
+		// For Plaintext, different versions must differ
+		let key_h2 = PoolKey(target.clone(), addr1, conn_cfg.clone(), ::http::Version::HTTP_2);
+		assert_ne!(key1, key_h2, "plaintext H1 and H2 must not match");
 	}
 }

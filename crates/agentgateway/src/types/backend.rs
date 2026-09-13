@@ -49,11 +49,12 @@ impl HTTP {
 				// Additionally, since gRPC is known to only work over HTTP/2, we special case that.
 				let tls = req.extensions().get::<TLSConnectionInfo>();
 				if tls.is_some() {
-					// Do not trust the downstream, use HTTP/1.1
+					// Do not trust the downstream protocol blindly, but if it is gRPC force HTTP/2.
+					// Otherwise, keep None so that ALPN can negotiate HTTP/2 if supported by upstream.
 					if http::is_grpc_content_type(req.headers()) {
 						Some(::http::Version::HTTP_2)
 					} else {
-						Some(::http::Version::HTTP_11)
+						None
 					}
 				} else {
 					None
