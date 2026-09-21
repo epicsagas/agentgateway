@@ -6,6 +6,7 @@ mod streamablehttp;
 
 use std::collections::HashMap;
 use std::io;
+use std::time::Duration;
 
 use agent_core::prelude::AssertSize;
 pub(crate) use client::McpHttpClient;
@@ -322,7 +323,13 @@ impl Upstream {
 			tool_name,
 		);
 
-		let result = async {
+		// Fanout/single merges wait for every target's terminal response, so one hung
+		// upstream stalls the whole client request — agents surface this as an MCP
+		// startup timeout. Bound the cheap protocol ops; long-running ops (tool calls,
+		// prompts, resources, tasks, subscriptions) keep the unbounded default.
+		const FAST_OP_TIMEOUT: Duration = Duration::from_secs(20);
+		let bounded = is_fast_protocol_op(&request.request);
+		let dispatch = async {
 			// stdio/SSE route server-initiated notifications through `get_event_stream`,
 			// which `subscriptions/listen` never merges. Reject them before sending
 			// an ack over a silent stream. OpenAPI has no notifications to lose.
@@ -360,8 +367,17 @@ impl Upstream {
 					Ok(Box::pin(c.send_message(request, &ctx).assert_size::<{ 6 * 1024 }>()).await?)
 				},
 			}
-		}
-		.await;
+		};
+		let result = if bounded {
+			match tokio::time::timeout(FAST_OP_TIMEOUT, dispatch).await {
+				Ok(res) => res,
+				Err(_) => Err(UpstreamError::Unavailable(format!(
+					"{method} to target '{target_name}' timed out after {FAST_OP_TIMEOUT:?}"
+				))),
+			}
+		} else {
+			dispatch.await
+		};
 		if let (Some(span), Err(error)) = (span.as_mut(), &result) {
 			span.set_error(ProxyResponseReason::MCP.to_string(), error.to_string());
 		}
@@ -681,6 +697,24 @@ impl UpstreamGroup {
 	}
 }
 
+/// True for cheap, must-be-snappy protocol operations. These get a bounded wait so a
+/// hung upstream can't stall a fanout merge (and with it, agent MCP startup).
+/// Long-running operations (tool calls, prompts, resources, tasks, completions,
+/// subscriptions) are excluded — they may legitimately take minutes.
+fn is_fast_protocol_op(r: &ClientRequest) -> bool {
+	matches!(
+		r,
+		ClientRequest::InitializeRequest(_)
+			| ClientRequest::PingRequest(_)
+			| ClientRequest::ListToolsRequest(_)
+			| ClientRequest::ListPromptsRequest(_)
+			| ClientRequest::ListResourcesRequest(_)
+			| ClientRequest::ListResourceTemplatesRequest(_)
+			| ClientRequest::DiscoverRequest(_)
+			| ClientRequest::SetLevelRequest(_)
+	)
+}
+
 /// Extension names are unioned across all targets, but we only keep settings when all targets agree
 /// on the same settings object. If any target has a different settings object for the same
 /// extension, we log a warning and advertise the extension with empty settings.
@@ -711,6 +745,21 @@ fn merge_extension_capabilities<'a>(
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	fn fast(r: ClientRequest) -> bool {
+		is_fast_protocol_op(&r)
+	}
+
+	#[test]
+	fn fast_ops_are_bounded_slow_ops_are_not() {
+		let init = rmcp::model::InitializeRequest::new(rmcp::model::ClientInfo::default());
+		assert!(fast(init.into()));
+		assert!(fast(rmcp::model::ListToolsRequest::default().into()));
+
+		// Long-running: may take minutes, must stay unbounded.
+		let call = rmcp::model::CallToolRequest::new(rmcp::model::CallToolRequestParams::new("t"));
+		assert!(!fast(call.into()));
+	}
 
 	fn ext(id: &str, settings: serde_json::Value) -> ExtensionCapabilities {
 		let mut e = ExtensionCapabilities::new();
