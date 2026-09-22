@@ -293,6 +293,10 @@ impl ResolvedBackendTLS {
 				trace!(valid, invalid, "added root certificates")
 			} else {
 				// TODO: we probably should do this once globally!
+				tracing::debug!(
+					count = crate::http::backendtls::SYSTEM_ROOT.certs.len(),
+					"DIAG system roots loaded"
+				);
 				for cert in &crate::http::backendtls::SYSTEM_ROOT.certs {
 					roots.add(cert.clone()).unwrap();
 				}

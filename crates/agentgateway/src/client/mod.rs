@@ -512,6 +512,7 @@ impl Connector {
 					.resolve(hostname.clone())
 					.await
 					.map_err(|_| ProxyError::DnsResolution)?;
+				tracing::debug!(%hostname, %ip, "DIAG resolved target");
 				SocketAddr::from((ip, *port))
 			},
 			Target::UnixSocket(_) => {
