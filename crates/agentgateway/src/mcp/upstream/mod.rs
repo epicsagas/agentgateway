@@ -327,7 +327,16 @@ impl Upstream {
 		// upstream stalls the whole client request — agents surface this as an MCP
 		// startup timeout. Bound the cheap protocol ops; long-running ops (tool calls,
 		// prompts, resources, tasks, subscriptions) keep the unbounded default.
-		const FAST_OP_TIMEOUT: Duration = Duration::from_secs(20);
+		// Overridable via AGW_MCP_FAST_OP_TIMEOUT_SECS for machines whose stdio
+		// upstreams spawn slowly (cold uv/npx starts).
+		static FAST_OP_TIMEOUT: std::sync::LazyLock<Duration> = std::sync::LazyLock::new(|| {
+			const DEFAULT_SECS: u64 = 20;
+			std::env::var("AGW_MCP_FAST_OP_TIMEOUT_SECS")
+				.ok()
+				.and_then(|v| v.parse().ok())
+				.map(Duration::from_secs)
+				.unwrap_or(Duration::from_secs(DEFAULT_SECS))
+		});
 		let bounded = is_fast_protocol_op(&request.request);
 		let dispatch = async {
 			// stdio/SSE route server-initiated notifications through `get_event_stream`,
@@ -369,10 +378,11 @@ impl Upstream {
 			}
 		};
 		let result = if bounded {
-			match tokio::time::timeout(FAST_OP_TIMEOUT, dispatch).await {
+			match tokio::time::timeout(*FAST_OP_TIMEOUT, dispatch).await {
 				Ok(res) => res,
 				Err(_) => Err(UpstreamError::Unavailable(format!(
-					"{method} to target '{target_name}' timed out after {FAST_OP_TIMEOUT:?}"
+					"{method} to target '{target_name}' timed out after {:?}",
+					*FAST_OP_TIMEOUT
 				))),
 			}
 		} else {
